@@ -1,0 +1,6 @@
+{
+  "bot_token": "123456789:AA...твой_токен_от_BotFather",
+  "channel_id": "-1001234567890",
+  "interval_seconds": 900,
+  "per_page": 50
+}
