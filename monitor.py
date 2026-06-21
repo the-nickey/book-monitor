@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
-"""Монитор новых поступлений abelbooks.ru → закрытый Telegram-канал."""
+"""Монитор книжных новинок и продаж → закрытый Telegram-канал.
+
+Источники:
+  abel_new   — новые поступления abelbooks.ru (в наличии)
+  abel_sold  — проданные на abelbooks.ru (детект по появлению в наборе проданных)
+  moscow     — букинист moscowbooks.ru по фильтру (год/неделя)
+"""
 import html
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -10,57 +17,163 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-API = "https://abelbooks.ru/wp-json/wc/store/v1/products"
-UA = "abel-monitor/1.0 (personal new-arrivals notifier)"
+UA = "book-monitor/1.0 (personal new-arrivals notifier)"
 HERE = Path(__file__).resolve().parent
-STATE_FILE = HERE / "seen_ids.json"
+STATE_FILE = HERE / "state.json"
 CONFIG_FILE = HERE / "config.json"
+
+ABEL_API = "https://abelbooks.ru/wp-json/wc/store/v1/products"
+MOSCOW_HOST = "https://www.moscowbooks.ru"
+MOSCOW_URL = MOSCOW_HOST + "/bookinist/?yf=1940&date_in=week"
 
 
 def load_config():
     cfg = json.loads(CONFIG_FILE.read_text("utf-8")) if CONFIG_FILE.exists() else {}
     token = os.environ.get("BOT_TOKEN") or cfg.get("bot_token")
     chat = os.environ.get("CHANNEL_ID") or cfg.get("channel_id")
-    interval = int(os.environ.get("INTERVAL") or cfg.get("interval_seconds", 900))
-    per_page = int(cfg.get("per_page", 50))
-    return token, chat, interval, per_page
+    interval = int(os.environ.get("INTERVAL") or cfg.get("interval_seconds", 300))
+    return token, chat, interval
 
 
-def load_seen():
-    if STATE_FILE.exists():
-        return set(json.loads(STATE_FILE.read_text("utf-8")))
-    return set()
+def http_get(url, binary=False, retries=2):
+    last = None
+    for _ in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=45) as r:
+                return r.read() if binary else r.read().decode("utf-8")
+        except urllib.error.HTTPError:
+            raise
+        except OSError as e:  # таймаут/сетевой сбой — повторим
+            last = e
+            time.sleep(2)
+    raise last
 
 
-def save_seen(seen):
-    STATE_FILE.write_text(json.dumps(sorted(seen)), "utf-8")
+def abel_api(params):
+    return json.loads(http_get(f"{ABEL_API}?{urllib.parse.urlencode(params)}"))
 
 
-def fetch_latest(per_page):
-    params = urllib.parse.urlencode(
-        {"orderby": "date", "order": "desc", "per_page": per_page}
-    )
-    req = urllib.request.Request(f"{API}?{params}", headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read().decode("utf-8"))
+# ---------- источники: каждый возвращает список item ----------
+# item = {id, title, price, url, tag, images:[url,...]}
+
+def _abel_images(images):
+    if not images:
+        return []
+    img = images[0]
+    sized = []
+    for tok in (img.get("srcset") or "").split(","):
+        u, _, w = tok.strip().rpartition(" ")
+        if w.endswith("w") and w[:-1].isdigit():
+            sized.append((int(w[:-1]), u))
+    order = [u for _, u in sorted((c for c in sized if c[0] <= 1280), key=lambda x: -x[0])]
+    for extra in (img.get("thumbnail"), img.get("src")):
+        if extra and extra not in order:
+            order.append(extra)
+    return order
 
 
-def format_message(p):
-    name = html.escape(p.get("name") or "Без названия")
+def _abel_item(p, tag):
     prices = p.get("prices") or {}
     price = prices.get("price")
     minor = prices.get("currency_minor_unit", 0) or 0
-    symbol = prices.get("currency_symbol", "₽")
-    cats = ", ".join(html.escape(c["name"]) for c in (p.get("categories") or [])[:3])
-
-    lines = [f"📚 <b>{name}</b>"]
+    price_str = None
     if price not in (None, ""):
         val = int(price) / (10 ** minor) if minor else int(price)
-        lines.append(f"💰 {val:,.0f}".replace(",", " ") + f" {symbol}")
-    if cats:
-        lines.append(f"🏷 {cats}")
-    lines.append(f'<a href="{p.get("permalink") or "https://abelbooks.ru/"}">Открыть на сайте</a>')
-    return "\n".join(lines)
+        if val:  # у проданных цена обнулена в 0 — не показываем
+            price_str = f"{val:,.0f}".replace(",", " ") + f" {prices.get('currency_symbol', '₽')}"
+    return {
+        "id": str(p["id"]),
+        "title": html.unescape(p.get("name") or "Без названия"),
+        "price": price_str,
+        "url": p.get("permalink") or "https://abelbooks.ru/",
+        "tag": tag,
+        "images": _abel_images(p.get("images") or []),
+    }
+
+
+def source_abel_new():
+    products = abel_api({"orderby": "date", "order": "desc", "per_page": 50, "stock_status": "instock"})
+    return [_abel_item(p, "Абель – в продаже") for p in products]
+
+
+def source_abel_sold():
+    items, page = [], 1
+    while page <= 30:
+        batch = abel_api({"orderby": "date", "order": "desc", "per_page": 100,
+                          "stock_status": "outofstock", "page": page})
+        if not batch:
+            break
+        items += [_abel_item(p, "Абель – продано") for p in batch]
+        if len(batch) < 100:
+            break
+        page += 1
+        time.sleep(0.3)
+    return items
+
+
+def source_moscow():
+    items, ids, page = [], set(), 1
+    while page <= 30:
+        url = MOSCOW_URL if page == 1 else f"{MOSCOW_URL}&page={page}"
+        try:
+            doc = http_get(url)
+        except urllib.error.HTTPError:
+            break
+        fresh_on_page = 0
+        for b in re.split(r'class="catalog__item', doc)[1:]:
+            m = re.search(r'data-productid="(\d+)"', b)
+            if not m or m.group(1) in ids:
+                continue
+            pid = m.group(1)
+            ids.add(pid)
+            fresh_on_page += 1
+            title = re.search(r'book-preview__title-link"[^>]*>\s*([^<]+?)\s*<', b)
+            href = re.search(r'href="(/bookinist/book/\d+/)"', b)
+            price = re.search(r'book-preview__price">\s*([^<]+?)\s*<', b)
+            imgm = re.search(r'<img[^>]*\bsrc="(/image/[^"]+)"', b)
+            items.append({
+                "id": pid,
+                "title": html.unescape(title.group(1)) if title else "Без названия",
+                "price": price.group(1).strip() if price else None,
+                "url": MOSCOW_HOST + (href.group(1) if href else "/bookinist/"),
+                "tag": "Moscowbooks – в продаже",
+                "images": [MOSCOW_HOST + imgm.group(1)] if imgm else [],
+            })
+        if fresh_on_page == 0:
+            break
+        page += 1
+        time.sleep(0.3)
+    return items
+
+
+SOURCES = {
+    "abel_new": source_abel_new,
+    "abel_sold": source_abel_sold,
+    "moscow": source_moscow,
+}
+
+
+# ---------- состояние ----------
+
+def load_state():
+    if STATE_FILE.exists():
+        return json.loads(STATE_FILE.read_text("utf-8"))
+    old = HERE / "seen_ids.json"  # миграция со старой одно-источниковой версии
+    if old.exists():
+        return {"abel_new": [str(i) for i in json.loads(old.read_text("utf-8"))]}
+    return {}
+
+
+def save_state(state):
+    STATE_FILE.write_text(json.dumps({k: sorted(v) for k, v in state.items()}, ensure_ascii=False), "utf-8")
+
+
+# ---------- Telegram ----------
+
+def format_message(item):
+    head = f'{item["tag"]} <a href="{item["url"]}">{html.escape(item["title"])}</a>'
+    return head + (f'\n{html.escape(item["price"])}' if item.get("price") else "")
 
 
 def tg_call(token, method, data):
@@ -70,32 +183,8 @@ def tg_call(token, method, data):
         return json.loads(r.read().decode("utf-8"))
 
 
-def _download(url):
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return r.read()
-
-
-def _image_candidates(image):
-    """URL обложек от предпочтительного размера к запасному.
-
-    Telegram не может скачать фото с сайта по URL (отдаёт заглушку), а оригинал
-    из src слишком большой для sendPhoto. Поэтому берём из srcset валидный размер.
-    """
-    sized = []
-    for token in (image.get("srcset") or "").split(","):
-        url, _, w = token.strip().rpartition(" ")
-        if w.endswith("w") and w[:-1].isdigit():
-            sized.append((int(w[:-1]), url))
-    order = [u for _, u in sorted((c for c in sized if c[0] <= 1280), key=lambda x: -x[0])]
-    for extra in (image.get("thumbnail"), image.get("src")):
-        if extra and extra not in order:
-            order.append(extra)
-    return order
-
-
 def _send_photo(token, chat, caption, data):
-    b = "----abel" + os.urandom(8).hex()
+    b = "----book" + os.urandom(8).hex()
     def part(name, value):
         return (f'--{b}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n').encode("utf-8")
     body = part("chat_id", chat) + part("caption", caption[:1024]) + part("parse_mode", "HTML")
@@ -108,70 +197,85 @@ def _send_photo(token, chat, caption, data):
         return json.loads(r.read().decode("utf-8"))
 
 
-def notify(token, chat, product):
-    text = format_message(product)
-    for url in _image_candidates((product.get("images") or [{}])[0]):
+def notify(token, chat, item):
+    text = format_message(item)
+    for url in item.get("images") or []:
         try:
-            data = _download(url)
+            data = http_get(url, binary=True)
         except Exception:
             continue
-        if data[:3] != b"\xff\xd8\xff":  # сайт отдал не jpeg (заглушку) — следующий
+        if data[:3] != b"\xff\xd8\xff" and data[:4] != b"\x89PNG":  # не картинка (заглушка)
             continue
         try:
             if _send_photo(token, chat, text, data).get("ok"):
                 return
         except urllib.error.HTTPError:
-            continue  # размер/пропорции не подошли — пробуем меньший
-    tg_call(token, "sendMessage", {"chat_id": chat, "text": text, "parse_mode": "HTML"})
+            continue  # размер/пропорции не подошли — пробуем следующий
+    tg_call(token, "sendMessage", {"chat_id": chat, "text": text, "parse_mode": "HTML",
+                                   "disable_web_page_preview": "true"})
 
 
-def check_once(token, chat, per_page, seen):
-    products = fetch_latest(per_page)
-    first_run = not seen
-    fresh = [p for p in products if p["id"] not in seen]
-    for p in sorted(fresh, key=lambda x: x["id"]):
-        if not first_run:
-            try:
-                notify(token, chat, p)
-                time.sleep(1)  # бережём Telegram rate limit
-            except Exception as e:
-                print(f"send error {p['id']}: {e}", file=sys.stderr)
-                continue
-        seen.add(p["id"])
-    if fresh:
-        save_seen(seen)
-    return len(fresh), first_run
+def check_once(token, chat, state):
+    total = 0
+    for name, fetch in SOURCES.items():
+        try:
+            items = fetch()
+        except Exception as e:
+            print(f"[{name}] ошибка источника: {e}", file=sys.stderr)
+            continue
+        first_run = name not in state
+        seen = set(state.get(name, []))
+        fresh = [it for it in items if it["id"] not in seen]
+        for it in sorted(fresh, key=lambda x: int(x["id"])):
+            if not first_run:
+                try:
+                    notify(token, chat, it)
+                    time.sleep(1)
+                except Exception as e:
+                    print(f"[{name}] send error {it['id']}: {e}", file=sys.stderr)
+                    continue
+            seen.add(it["id"])
+        state[name] = seen
+        print(f"[{name}] " + (f"seed {len(fresh)} (без отправки)" if first_run else f"новых: {len(fresh)}"))
+        total += 0 if first_run else len(fresh)
+    save_state(state)
+    return total
 
 
 def main():
     argv = sys.argv[1:]
-    token, chat, interval, per_page = load_config()
-
-    if "--test" in argv:
-        if not token or not chat:
-            sys.exit("Для --test нужны bot_token и channel_id в config.json")
-        products = fetch_latest(1)
-        if not products:
-            sys.exit("API не вернул товаров")
-        notify(token, chat, products[0])
-        print("test: отправил последний товар в канал — проверь Telegram")
-        return
+    token, chat, interval = load_config()
 
     if "--dry" in argv:
-        for p in fetch_latest(min(per_page, 10)):
-            print(format_message(p) + "\n---")
+        which = next((a for a in argv if a in SOURCES), None)
+        for name in ([which] if which else list(SOURCES)):
+            items = SOURCES[name]()
+            print(f"### {name}: {len(items)} позиций")
+            for it in items[:5]:
+                print(format_message(it) + "\n---")
         return
 
     if not token or not chat:
-        sys.exit("Заполни bot_token и channel_id в config.json (см. config.example.json)")
+        sys.exit("Заполни bot_token и channel_id (config.json или env BOT_TOKEN/CHANNEL_ID)")
 
-    seen = load_seen()
+    if "--test" in argv:
+        for name, fetch in SOURCES.items():
+            try:
+                items = fetch()
+                if items:
+                    notify(token, chat, items[0])
+                    time.sleep(1)
+                    print(f"[{name}] тест отправлен: {items[0]['title'][:50]}")
+            except Exception as e:
+                print(f"[{name}] ошибка теста: {e}", file=sys.stderr)
+        return
+
+    state = load_state()
     loop = "--loop" in argv
     while True:
         try:
-            n, first = check_once(token, chat, per_page, seen)
-            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-            print(f"[{stamp}] " + (f"первый запуск: засеяно {n}, без отправки" if first else f"новых: {n}"))
+            n = check_once(token, chat, state)
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] итого новых: {n}")
         except Exception as e:
             print(f"[{time.strftime('%H:%M:%S')}] ошибка: {e}", file=sys.stderr)
         if not loop:

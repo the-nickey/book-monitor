@@ -1,15 +1,15 @@
-name: abel-monitor
+name: book-monitor
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: abel-monitor
+  group: book-monitor
   cancel-in-progress: false
 
 jobs:
@@ -22,13 +22,13 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
         run: python3 monitor.py
-      - name: Persist seen_ids.json
+      - name: Persist state
         run: |
-          if ! git diff --quiet -- seen_ids.json; then
+          if ! git diff --quiet -- state.json; then
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add seen_ids.json
-            git commit -m "update seen_ids"
+            git add state.json
+            git commit -m "update state"
             git pull --rebase --autostash
             git push
           fi
