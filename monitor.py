@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """Монитор книжных новинок и продаж → закрытый Telegram-канал.
 
-Источники:
-  abel_new   — новые поступления abelbooks.ru (в наличии)
-  abel_sold  — проданные на abelbooks.ru (детект по появлению в наборе проданных)
-  moscow     — букинист moscowbooks.ru по фильтру (год/неделя)
+Источники (у каждого свой интервал опроса):
+  abel_new   — новые поступления abelbooks.ru (в наличии)         — 5 мин
+  abel_sold  — проданные на abelbooks.ru (diff набора проданных)  — 1 час
+  moscow     — букинист moscowbooks.ru по фильтру (год/неделя)    — 5 мин
 
-К сайтам ходим напрямую; в Telegram — через HTTP-прокси (TG_PROXY), т.к. на
-российских серверах api.telegram.org заблокирован.
+К сайтам ходим напрямую под браузерным UA; в Telegram — через HTTP-прокси
+(TG_PROXY), т.к. на российских серверах api.telegram.org заблокирован.
 """
 import html
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -20,7 +21,8 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-UA = "book-monitor/1.0 (personal new-arrivals notifier)"
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 HERE = Path(__file__).resolve().parent
 STATE_FILE = HERE / "state.json"
 CONFIG_FILE = HERE / "config.json"
@@ -31,13 +33,16 @@ MOSCOW_HOST = "https://www.moscowbooks.ru"
 MOSCOW_URL = MOSCOW_HOST + "/bookinist/?yf=1940&date_in=week"
 
 
+def stamp():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def load_config():
     cfg = json.loads(CONFIG_FILE.read_text("utf-8")) if CONFIG_FILE.exists() else {}
     token = os.environ.get("BOT_TOKEN") or cfg.get("bot_token")
     chat = os.environ.get("CHANNEL_ID") or cfg.get("channel_id")
-    interval = int(os.environ.get("INTERVAL") or cfg.get("interval_seconds", 300))
     proxy = os.environ.get("TELEGRAM_PROXY") or cfg.get("telegram_proxy")
-    return token, chat, interval, proxy
+    return token, chat, proxy, cfg.get("intervals") or {}
 
 
 def http_get(url, binary=False, retries=2):
@@ -152,10 +157,11 @@ def source_moscow():
     return items
 
 
+# имя → (функция, интервал опроса в секундах по умолчанию)
 SOURCES = {
-    "abel_new": source_abel_new,
-    "abel_sold": source_abel_sold,
-    "moscow": source_moscow,
+    "abel_new":  {"fn": source_abel_new,  "interval": 300},
+    "abel_sold": {"fn": source_abel_sold, "interval": 3600},
+    "moscow":    {"fn": source_moscow,    "interval": 300},
 }
 
 
@@ -228,43 +234,68 @@ def notify(token, chat, item):
                                    "disable_web_page_preview": "true"})
 
 
+def check_source(name, fetch, token, chat, state):
+    items = fetch()
+    first_run = name not in state
+    seen = set(state.get(name, []))
+    fresh = [it for it in items if it["id"] not in seen]
+    for it in sorted(fresh, key=lambda x: int(x["id"])):
+        if not first_run:
+            try:
+                notify(token, chat, it)
+                time.sleep(1)
+            except Exception as e:
+                print(f"[{name}] send error {it['id']}: {e}", file=sys.stderr)
+                continue
+        seen.add(it["id"])
+    state[name] = seen
+    save_state(state)  # сохраняем сразу — надёжно между источниками и рестартами
+    return len(fresh), first_run
+
+
 def check_once(token, chat, state):
     total = 0
-    for name, fetch in SOURCES.items():
+    for name, meta in SOURCES.items():
         try:
-            items = fetch()
+            n, first = check_source(name, meta["fn"], token, chat, state)
+            print(f"[{name}] " + (f"seed {n} (без отправки)" if first else f"новых: {n}"))
+            total += 0 if first else n
         except Exception as e:
             print(f"[{name}] ошибка источника: {e}", file=sys.stderr)
-            continue
-        first_run = name not in state
-        seen = set(state.get(name, []))
-        fresh = [it for it in items if it["id"] not in seen]
-        for it in sorted(fresh, key=lambda x: int(x["id"])):
-            if not first_run:
-                try:
-                    notify(token, chat, it)
-                    time.sleep(1)
-                except Exception as e:
-                    print(f"[{name}] send error {it['id']}: {e}", file=sys.stderr)
-                    continue
-            seen.add(it["id"])
-        state[name] = seen
-        print(f"[{name}] " + (f"seed {len(fresh)} (без отправки)" if first_run else f"новых: {len(fresh)}"))
-        total += 0 if first_run else len(fresh)
-    save_state(state)
     return total
+
+
+def run_loop(token, chat, state):
+    """Каждый источник опрашивается по своему интервалу + лёгкий джиттер,
+    чтобы не создавать в логах сайта ровный периодический пульс."""
+    due = {name: 0.0 for name in SOURCES}
+    while True:
+        now = time.time()
+        for name, meta in SOURCES.items():
+            if now < due[name]:
+                continue
+            try:
+                n, first = check_source(name, meta["fn"], token, chat, state)
+                print(f"[{stamp()}] [{name}] " + (f"seed {n} (без отправки)" if first else f"новых: {n}"))
+            except Exception as e:
+                print(f"[{stamp()}] [{name}] ошибка источника: {e}", file=sys.stderr)
+            due[name] = time.time() + meta["interval"] * random.uniform(0.9, 1.1)
+        time.sleep(random.uniform(45, 75))
 
 
 def main():
     global TG_PROXY
     argv = sys.argv[1:]
-    token, chat, interval, proxy = load_config()
+    token, chat, proxy, intervals = load_config()
     TG_PROXY = proxy
+    for name, sec in intervals.items():  # необязательный override интервалов из config
+        if name in SOURCES:
+            SOURCES[name]["interval"] = int(sec)
 
     if "--dry" in argv:
         which = next((a for a in argv if a in SOURCES), None)
         for name in ([which] if which else list(SOURCES)):
-            items = SOURCES[name]()
+            items = SOURCES[name]["fn"]()
             print(f"### {name}: {len(items)} позиций")
             for it in items[:5]:
                 print(format_message(it) + "\n---")
@@ -274,9 +305,9 @@ def main():
         sys.exit("Заполни bot_token и channel_id (config.json или env BOT_TOKEN/CHANNEL_ID)")
 
     if "--test" in argv:
-        for name, fetch in SOURCES.items():
+        for name, meta in SOURCES.items():
             try:
-                items = fetch()
+                items = meta["fn"]()
                 if items:
                     notify(token, chat, items[0])
                     time.sleep(1)
@@ -286,16 +317,11 @@ def main():
         return
 
     state = load_state()
-    loop = "--loop" in argv
-    while True:
-        try:
-            n = check_once(token, chat, state)
-            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] итого новых: {n}")
-        except Exception as e:
-            print(f"[{time.strftime('%H:%M:%S')}] ошибка: {e}", file=sys.stderr)
-        if not loop:
-            break
-        time.sleep(interval)
+    if "--loop" in argv:
+        run_loop(token, chat, state)
+    else:
+        n = check_once(token, chat, state)
+        print(f"[{stamp()}] итого новых: {n}")
 
 
 if __name__ == "__main__":
