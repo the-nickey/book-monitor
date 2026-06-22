@@ -1,9 +1,7 @@
 name: book-monitor
 
 on:
-  schedule:
-    - cron: '*/5 * * * *'
-  workflow_dispatch:
+  workflow_dispatch:   # авто-расписание отключено: прод переехал на VPS (systemd --loop, 5 мин)
 
 permissions:
   contents: write
