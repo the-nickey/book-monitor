@@ -5,6 +5,9 @@
   abel_new   — новые поступления abelbooks.ru (в наличии)
   abel_sold  — проданные на abelbooks.ru (детект по появлению в наборе проданных)
   moscow     — букинист moscowbooks.ru по фильтру (год/неделя)
+
+К сайтам ходим напрямую; в Telegram — через HTTP-прокси (TG_PROXY), т.к. на
+российских серверах api.telegram.org заблокирован.
 """
 import html
 import json
@@ -21,6 +24,7 @@ UA = "book-monitor/1.0 (personal new-arrivals notifier)"
 HERE = Path(__file__).resolve().parent
 STATE_FILE = HERE / "state.json"
 CONFIG_FILE = HERE / "config.json"
+TG_PROXY = None  # прокси только для api.telegram.org (сайты — напрямую); ставится из конфига
 
 ABEL_API = "https://abelbooks.ru/wp-json/wc/store/v1/products"
 MOSCOW_HOST = "https://www.moscowbooks.ru"
@@ -32,7 +36,8 @@ def load_config():
     token = os.environ.get("BOT_TOKEN") or cfg.get("bot_token")
     chat = os.environ.get("CHANNEL_ID") or cfg.get("channel_id")
     interval = int(os.environ.get("INTERVAL") or cfg.get("interval_seconds", 300))
-    return token, chat, interval
+    proxy = os.environ.get("TELEGRAM_PROXY") or cfg.get("telegram_proxy")
+    return token, chat, interval, proxy
 
 
 def http_get(url, binary=False, retries=2):
@@ -169,7 +174,15 @@ def save_state(state):
     STATE_FILE.write_text(json.dumps({k: sorted(v) for k, v in state.items()}, ensure_ascii=False), "utf-8")
 
 
-# ---------- Telegram ----------
+# ---------- Telegram (через прокси) ----------
+
+def _tg_open(req, timeout):
+    if TG_PROXY:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": TG_PROXY, "https": TG_PROXY}))
+        return opener.open(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout)
+
 
 def format_message(item):
     head = f'{item["tag"]} <a href="{item["url"]}">{html.escape(item["title"])}</a>'
@@ -179,7 +192,7 @@ def format_message(item):
 def tg_call(token, method, data):
     body = urllib.parse.urlencode(data).encode("utf-8")
     req = urllib.request.Request(f"https://api.telegram.org/bot{token}/{method}", data=body)
-    with urllib.request.urlopen(req, timeout=30) as r:
+    with _tg_open(req, 30) as r:
         return json.loads(r.read().decode("utf-8"))
 
 
@@ -193,7 +206,7 @@ def _send_photo(token, chat, caption, data):
     body += data + b"\r\n" + f"--{b}--\r\n".encode("utf-8")
     req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendPhoto", data=body,
                                  headers={"Content-Type": f"multipart/form-data; boundary={b}"})
-    with urllib.request.urlopen(req, timeout=60) as r:
+    with _tg_open(req, 60) as r:
         return json.loads(r.read().decode("utf-8"))
 
 
@@ -243,8 +256,10 @@ def check_once(token, chat, state):
 
 
 def main():
+    global TG_PROXY
     argv = sys.argv[1:]
-    token, chat, interval = load_config()
+    token, chat, interval, proxy = load_config()
+    TG_PROXY = proxy
 
     if "--dry" in argv:
         which = next((a for a in argv if a in SOURCES), None)
