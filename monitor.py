@@ -31,6 +31,8 @@ TG_PROXY = None  # прокси только для api.telegram.org (сайты
 ABEL_API = "https://abelbooks.ru/wp-json/wc/store/v1/products"
 MOSCOW_HOST = "https://www.moscowbooks.ru"
 MOSCOW_URL = MOSCOW_HOST + "/bookinist/?yf=1940&date_in=week"
+ANTIQUE_HOST = "https://antiquebooks.ru"
+ANTIQUE_URL = ANTIQUE_HOST + "/category.php?choice=newbooks"
 
 
 def stamp():
@@ -157,11 +159,43 @@ def source_moscow():
     return items
 
 
+def source_antique():
+    items, ids = [], set()
+    try:
+        doc = http_get(ANTIQUE_URL)
+    except urllib.error.HTTPError:
+        return items
+    for b in re.split(r'<tr><td class="style_main_table_td"', doc)[1:]:
+        m = re.search(r'ch=book&book=(\d+)', b)
+        if not m or m.group(1) in ids:
+            continue
+        bid = m.group(1)
+        ids.add(bid)
+        title = re.search(r'class=title_author[^>]*><b>\s*(.+?)\s*</b>', b, re.S)
+        price_m = re.search(r'Цена:\s*([\d][\d.\s]*?)\s*руб', b)
+        imgm = re.search(r'src="(/pic/[^"]+_preview\.jpg)"', b)
+        price = None
+        if price_m:
+            digits = re.sub(r'\D', '', price_m.group(1))
+            if digits:
+                price = f"{int(digits):,}".replace(",", " ") + " ₽"
+        items.append({
+            "id": bid,
+            "title": html.unescape(re.sub(r'<[^>]+>', '', title.group(1)).strip()) if title else "Без названия",
+            "price": price,
+            "url": f"{ANTIQUE_HOST}/category.php?ch=book&book={bid}",
+            "tag": "AntiqueBooks – новое поступление",
+            "images": [ANTIQUE_HOST + imgm.group(1)] if imgm else [],
+        })
+    return items
+
+
 # имя → (функция, интервал опроса в секундах по умолчанию)
 SOURCES = {
     "abel_new":  {"fn": source_abel_new,  "interval": 300},
     "abel_sold": {"fn": source_abel_sold, "interval": 3600},
     "moscow":    {"fn": source_moscow,    "interval": 300},
+    "antique":   {"fn": source_antique,   "interval": 3600},
 }
 
 
