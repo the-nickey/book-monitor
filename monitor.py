@@ -5,10 +5,15 @@
   abel_new   — новые поступления abelbooks.ru (в наличии)         — 5 мин
   abel_sold  — проданные на abelbooks.ru (diff набора проданных)  — 1 час
   moscow     — букинист moscowbooks.ru по фильтру (год/неделя)    — 5 мин
+  antique    — новые поступления antiquebooks.ru                  — 1 час
 
-К сайтам ходим напрямую под браузерным UA; в Telegram — через HTTP-прокси
-(TG_PROXY), т.к. на российских серверах api.telegram.org заблокирован.
+Прайс-база (books.csv): цена проданного обнуляется сайтом, поэтому запоминаем
+цену книги, пока она в наличии; при продаже подставляем её + считаем, сколько
+дней книга провисела (first_seen → sold_date).
+
+К сайтам ходим напрямую под браузерным UA; в Telegram — через HTTP-прокси.
 """
+import csv
 import html
 import json
 import os
@@ -19,6 +24,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import date
 from pathlib import Path
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -26,7 +32,10 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 HERE = Path(__file__).resolve().parent
 STATE_FILE = HERE / "state.json"
 CONFIG_FILE = HERE / "config.json"
-TG_PROXY = None  # прокси только для api.telegram.org (сайты — напрямую); ставится из конфига
+BOOKS_FILE = HERE / "books.csv"
+BOOK_FIELDS = ["id", "title", "price", "first_seen", "status", "sold_date", "days_on_shelf"]
+TG_PROXY = None
+BOOKS = {}  # id -> запись прайс-базы (см. BOOK_FIELDS); наполняется из abel в наличии
 
 ABEL_API = "https://abelbooks.ru/wp-json/wc/store/v1/products"
 MOSCOW_HOST = "https://www.moscowbooks.ru"
@@ -37,6 +46,15 @@ ANTIQUE_URL = ANTIQUE_HOST + "/category.php?choice=newbooks"
 
 def stamp():
     return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def plural_days(n):
+    n = abs(int(n))
+    if n % 10 == 1 and n % 100 != 11:
+        return f"{n} день"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return f"{n} дня"
+    return f"{n} дней"
 
 
 def load_config():
@@ -199,19 +217,73 @@ SOURCES = {
 }
 
 
-# ---------- состояние ----------
+# ---------- прайс-база (books.csv) ----------
 
-def load_state():
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text("utf-8"))
-    old = HERE / "seen_ids.json"  # миграция со старой одно-источниковой версии
-    if old.exists():
-        return {"abel_new": [str(i) for i in json.loads(old.read_text("utf-8"))]}
-    return {}
+def load_books():
+    if not BOOKS_FILE.exists():
+        return {}
+    with open(BOOKS_FILE, newline="", encoding="utf-8") as f:
+        return {row["id"]: row for row in csv.DictReader(f)}
 
 
-def save_state(state):
-    STATE_FILE.write_text(json.dumps({k: sorted(v) for k, v in state.items()}, ensure_ascii=False), "utf-8")
+def save_books():
+    with open(BOOKS_FILE, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=BOOK_FIELDS)
+        w.writeheader()
+        w.writerows(BOOKS.values())
+
+
+def record_instock(items):
+    """Книги в наличии — запоминаем/обновляем цену и дату первой встречи."""
+    today = date.today().isoformat()
+    for it in items:
+        rec = BOOKS.get(it["id"])
+        if rec is None:
+            BOOKS[it["id"]] = {"id": it["id"], "title": it["title"], "price": it["price"] or "",
+                               "first_seen": today, "status": "instock", "sold_date": "", "days_on_shelf": ""}
+        else:
+            if it["price"]:
+                rec["price"] = it["price"]
+            rec["title"] = it["title"]
+            if rec["status"] == "sold":  # снова в наличии — сняли пометку продажи
+                rec.update(status="instock", sold_date="", days_on_shelf="")
+
+
+def enrich_sold(items):
+    """Проданные — фиксируем делистинг и обогащаем карточку ценой/днями из базы."""
+    today = date.today().isoformat()
+    for it in items:
+        rec = BOOKS.get(it["id"])
+        if not rec:
+            continue  # историческая продажа (до запуска базы) — данных нет
+        if rec["status"] != "sold":
+            rec["status"] = "sold"
+            rec["sold_date"] = today
+            try:
+                rec["days_on_shelf"] = str(max((date.fromisoformat(today) - date.fromisoformat(rec["first_seen"])).days, 0))
+            except ValueError:
+                rec["days_on_shelf"] = ""
+        if not it.get("price") and rec.get("price"):
+            it["price"] = rec["price"]
+        it["days"] = rec.get("days_on_shelf") or ""
+        it["first_seen"] = rec.get("first_seen") or ""
+
+
+def refresh_books():
+    """Снимок всех книг в наличии → пополнение прайс-базы (первичный обстрел и раз в сутки)."""
+    total, page = 0, 1
+    while page <= 40:
+        batch = abel_api({"orderby": "date", "order": "desc", "per_page": 100, "stock_status": "instock", "page": page})
+        if not batch:
+            break
+        record_instock([_abel_item(p, "") for p in batch])  # обрабатываем постранично — не держим весь каталог в памяти
+        total += len(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+        time.sleep(0.3)
+    save_books()
+    return total
 
 
 # ---------- Telegram (через прокси) ----------
@@ -226,7 +298,14 @@ def _tg_open(req, timeout):
 
 def format_message(item):
     head = f'{item["tag"]} <a href="{item["url"]}">{html.escape(item["title"])}</a>'
-    return head + (f'\n{html.escape(item["price"])}' if item.get("price") else "")
+    extras = []
+    if item.get("price"):
+        extras.append(html.escape(item["price"]))
+    if item.get("days"):
+        extras.append(f"провисела {plural_days(item['days'])}")
+    if item.get("first_seen"):
+        extras.append(f"впервые заметили {item['first_seen']}")
+    return head + ("\n" + " · ".join(extras) if extras else "")
 
 
 def tg_call(token, method, data):
@@ -270,6 +349,12 @@ def notify(token, chat, item):
 
 def check_source(name, fetch, token, chat, state):
     items = fetch()
+    if name == "abel_new":
+        record_instock(items)
+        save_books()
+    elif name == "abel_sold":
+        enrich_sold(items)  # фиксирует делистинги и подставляет цену/дни
+        save_books()
     first_run = name not in state
     seen = set(state.get(name, []))
     fresh = [it for it in items if it["id"] not in seen]
@@ -283,8 +368,21 @@ def check_source(name, fetch, token, chat, state):
                 continue
         seen.add(it["id"])
     state[name] = seen
-    save_state(state)  # сохраняем сразу — надёжно между источниками и рестартами
+    save_state(state)
     return len(fresh), first_run
+
+
+def load_state():
+    if STATE_FILE.exists():
+        return json.loads(STATE_FILE.read_text("utf-8"))
+    old = HERE / "seen_ids.json"
+    if old.exists():
+        return {"abel_new": [str(i) for i in json.loads(old.read_text("utf-8"))]}
+    return {}
+
+
+def save_state(state):
+    STATE_FILE.write_text(json.dumps({k: sorted(v) for k, v in state.items()}, ensure_ascii=False), "utf-8")
 
 
 def check_once(token, chat, state):
@@ -300,11 +398,19 @@ def check_once(token, chat, state):
 
 
 def run_loop(token, chat, state):
-    """Каждый источник опрашивается по своему интервалу + лёгкий джиттер,
-    чтобы не создавать в логах сайта ровный периодический пульс."""
+    """Источники — по своим интервалам + джиттер. Прайс-база: первичный обстрел
+    (если пустая) и снимок раз в сутки."""
     due = {name: 0.0 for name in SOURCES}
+    snap_due = 0.0 if not BOOKS else time.time() + 86400
     while True:
         now = time.time()
+        if now >= snap_due:
+            try:
+                n = refresh_books()
+                print(f"[{stamp()}] [books] снимок цен: {n} в наличии, {len(BOOKS)} всего в базе")
+            except Exception as e:
+                print(f"[{stamp()}] [books] ошибка снимка: {e}", file=sys.stderr)
+            snap_due = time.time() + 86400 * random.uniform(0.9, 1.1)
         for name, meta in SOURCES.items():
             if now < due[name]:
                 continue
@@ -318,13 +424,22 @@ def run_loop(token, chat, state):
 
 
 def main():
-    global TG_PROXY
+    global TG_PROXY, BOOKS
     argv = sys.argv[1:]
     token, chat, proxy, intervals = load_config()
     TG_PROXY = proxy
-    for name, sec in intervals.items():  # необязательный override интервалов из config
+    for name, sec in intervals.items():
         if name in SOURCES:
             SOURCES[name]["interval"] = int(sec)
+    BOOKS = load_books()
+
+    if "--snapshot" in argv:  # первичный обстрел прайс-базы + замер пика RAM
+        import resource
+        n = refresh_books()
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        mb = rss / 1048576 if sys.platform == "darwin" else rss / 1024  # mac: байты, linux: КБ
+        print(f"снимок: {n} в наличии, {len(BOOKS)} в базе | пик RAM ~{mb:.0f} МБ")
+        return
 
     if "--dry" in argv:
         which = next((a for a in argv if a in SOURCES), None)

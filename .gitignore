@@ -1,4 +1,5 @@
 config.json
+books.csv
 *.log
 .venv/
 __pycache__/
