@@ -103,19 +103,23 @@ def _abel_images(images):
     return order
 
 
-def _abel_item(p, tag):
+def _abel_price(p):
     prices = p.get("prices") or {}
     price = prices.get("price")
     minor = prices.get("currency_minor_unit", 0) or 0
-    price_str = None
-    if price not in (None, ""):
-        val = int(price) / (10 ** minor) if minor else int(price)
-        if val:  # у проданных цена обнулена в 0 — не показываем
-            price_str = f"{val:,.0f}".replace(",", " ") + f" {prices.get('currency_symbol', '₽')}"
+    if price in (None, ""):
+        return None
+    val = int(price) / (10 ** minor) if minor else int(price)
+    if not val:  # у проданных цена обнулена в 0
+        return None
+    return f"{val:,.0f}".replace(",", " ") + f" {prices.get('currency_symbol', '₽')}"
+
+
+def _abel_item(p, tag):
     return {
         "id": str(p["id"]),
         "title": html.unescape(p.get("name") or "Без названия"),
-        "price": price_str,
+        "price": _abel_price(p),
         "url": p.get("permalink") or "https://abelbooks.ru/",
         "tag": tag,
         "images": _abel_images(p.get("images") or []),
@@ -276,7 +280,9 @@ def refresh_books():
         batch = abel_api({"orderby": "date", "order": "desc", "per_page": 100, "stock_status": "instock", "page": page})
         if not batch:
             break
-        record_instock([_abel_item(p, "") for p in batch])  # обрабатываем постранично — не держим весь каталог в памяти
+        record_instock([{"id": str(p["id"]),
+                         "title": html.unescape(p.get("name") or "Без названия"),
+                         "price": _abel_price(p) or ""} for p in batch])  # только цены, без картинок
         total += len(batch)
         if len(batch) < 100:
             break
