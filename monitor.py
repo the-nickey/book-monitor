@@ -264,12 +264,11 @@ def enrich_sold(items):
             rec["status"] = "sold"
             rec["sold_date"] = today
             try:
-                rec["days_on_shelf"] = str(max((date.fromisoformat(today) - date.fromisoformat(rec["first_seen"])).days, 0))
+                rec["days_on_shelf"] = str(max((date.fromisoformat(today) - date.fromisoformat(rec["first_seen"][:10])).days, 0))
             except ValueError:
                 rec["days_on_shelf"] = ""
         if not it.get("price") and rec.get("price"):
             it["price"] = rec["price"]
-        it["days"] = rec.get("days_on_shelf") or ""
         it["first_seen"] = rec.get("first_seen") or ""
 
 
@@ -307,10 +306,18 @@ def format_message(item):
     extras = []
     if item.get("price"):
         extras.append(html.escape(item["price"]))
-    if item.get("days"):
-        extras.append(f"провисела {plural_days(item['days'])}")
-    if item.get("first_seen"):
-        extras.append(f"впервые заметили {item['first_seen']}")
+    fs = item.get("first_seen")
+    if fs:
+        iso = fs[:10]  # обе формы (ISO и пометка «2026-07-04 – …») начинаются с даты
+        try:
+            n = (date.today() - date.fromisoformat(iso)).days
+            ago = "сегодня" if n <= 0 else f"{plural_days(n)} назад"
+            s = f"впервые заметили {ago} – {iso}"
+            if "стали трекать" in fs:
+                s += " (в этот день стали трекать историю)"
+            extras.append(s)
+        except ValueError:
+            extras.append(f"впервые заметили {fs}")
     return head + ("\n" + " · ".join(extras) if extras else "")
 
 
