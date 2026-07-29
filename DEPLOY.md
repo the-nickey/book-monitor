@@ -1,45 +1,66 @@
-# Деплой на GitHub Actions (бесплатно, 24/7)
+# Деплой и координаты сервиса
 
-`monitor.py` гоняется раннером GitHub каждые 15 минут. Токен — в Secrets, состояние
-(`seen_ids.json`) — в репозитории. Фото работает (картинку качаем сами, не Telegram).
+**Прод крутится на VPS, НЕ на GitHub Actions.**
 
-## 1. Создать репозиторий
+GitHub Actions пробовали (крон) — он дросселит расписание до ~1 прогона в 1–2 часа,
+для нужной 5-минутной оперативности не годится. Переехали на VPS с `monitor.py --loop`.
+Workflow в `.github/workflows/monitor.yml` оставлен только под ручной `workflow_dispatch`,
+авто-расписание отключено. Репозиторий теперь — просто хранилище кода, деплой идёт с VPS.
 
-Проще всего — поставить GitHub CLI и дать мне доделать:
+## Координаты
+
+- **Сервер:** VPS `193.124.114.2` (RuVDS, Ubuntu 24.04, 1 vCPU / 431 МБ, **зарубежная локация**).
+  Root — по паролю (в личных заметках, не в git).
+- **Код на сервере:** `/root/book-monitor`.
+- **Служба:** systemd `book-monitor`, запускает `python3 monitor.py --loop`.
+  - логи: `journalctl -u book-monitor -f`
+  - статус / рестарт: `systemctl status book-monitor` · `systemctl restart book-monitor`
+- **Репо:** `github.com/the-nickey/book-monitor` (public, только хранение кода).
+- **Telegram** идёт через HTTP-прокси (`telegram_proxy` в `config.json`): в РФ 2026
+  `api.telegram.org` заблокирован (ТСПУ). Поэтому локация сервера **обязана быть зарубежной**;
+  сайты (abel/moscow/antique) с зарубежного IP доступны — проверено.
+
+## Как задеплоено (с нуля)
+
+1. Зарубежный VPS с Ubuntu; поставить `git` (`python3` уже есть, зависимостей у кода нет).
+2. `git clone https://github.com/the-nickey/book-monitor /root/book-monitor`
+3. Положить `config.json` (`bot_token`, `channel_id`, `telegram_proxy`, `interval_seconds`).
+4. systemd-юнит `/etc/systemd/system/book-monitor.service`:
+   ```ini
+   [Unit]
+   After=network-online.target
+   Wants=network-online.target
+   [Service]
+   Type=simple
+   Environment=PYTHONUNBUFFERED=1
+   WorkingDirectory=/root/book-monitor
+   ExecStart=/usr/bin/python3 /root/book-monitor/monitor.py --loop
+   Restart=always
+   RestartSec=15
+   [Install]
+   WantedBy=multi-user.target
+   ```
+   `PYTHONUNBUFFERED=1` обязателен — иначе `print` буферизуется и логи не видны в journald.
+5. `systemctl daemon-reload && systemctl enable --now book-monitor`
+6. Первый запуск сам делает первичный обстрел прайс-базы (`books.csv`) и seed состояния —
+   молча, без спама.
+
+## Апдейт кода
+
+Локально: правки `monitor.py` → `git pull --rebase` → `git commit && git push`.
+На сервере:
 ```
-brew install gh
-gh auth login        # GitHub.com → HTTPS → войти через браузер
+cd /root/book-monitor
+cp -f state.json /root/state.backup.json
+git fetch -q origin main && git reset --hard -q origin/main
+cp -f /root/state.backup.json state.json
+systemctl restart book-monitor
 ```
-После этого скажи «gh готов» — я сам создам репо, запушу и заведу секреты.
+`config.json` и `books.csv` в `.gitignore` → `reset --hard` их не трогает.
+Подмена самой `books.csv`: `systemctl stop` → scp → `start` (живая служба иначе перезапишет файл из памяти).
 
-Или вручную: создай **public** репозиторий на github.com (напр. `abel-monitor`) и запушь:
-```
-git remote add origin https://github.com/<логин>/abel-monitor.git
-git push -u origin main
-```
-Public — потому что у Actions неограниченные бесплатные минуты, а код не секретный
-(токен лежит в Secrets, не в коде).
+## Восстановление, если сервер умрёт
 
-## 2. Добавить секреты
-
-Repo → **Settings → Secrets and variables → Actions → New repository secret**:
-- `BOT_TOKEN` — токен бота
-- `CHANNEL_ID` — id канала (`-100…`)
-
-Локальный `config.json` в репо не попадает (он в `.gitignore`).
-
-## 3. Запустить
-
-Repo → **Actions** → workflow «abel-monitor» → **Run workflow** (ручная проверка).
-Дальше крутится сам каждые 15 минут.
-
-## Как хранится состояние
-
-`seen_ids.json` лежит в репо как стартовое (твои текущие 50 id). После каждого прогона
-workflow коммитит его обновление — так эфемерный раннер «помнит» виденное между запусками.
-Эти же коммиты держат расписание активным (иначе GitHub усыпляет cron после 60 дней тишины).
-
-## Минуты
-
-Public-репо — бесплатно без лимита. Если сделаешь private, поставь в `monitor.yml`
-`cron: '*/30 * * * *'` (лимит 2000 мин/мес).
+Локальная папка = полный бэкап (код + `config.json` + `books.csv` + `state.json`).
+Новый **зарубежный** VPS → скопировать папку целиком → тот же юнит → `systemctl start`.
+Продолжит с места, без пересева и без спама «старыми» новинками.

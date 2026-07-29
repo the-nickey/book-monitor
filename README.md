@@ -1,59 +1,28 @@
-# abel-monitor
+# book-monitor
 
-Монитор новых поступлений на [abelbooks.ru](https://abelbooks.ru/). Каждые N минут
-опрашивает магазин и шлёт карточку нового товара в закрытый Telegram-канал.
+Монитор новых поступлений и продаж в антикварных книжных лавках → закрытый
+Telegram-канал. Четыре источника (abelbooks — поступления и продажи, moscowbooks,
+antiquebooks). Голый `python3`, зависимостей нет.
 
-Источник — открытый WooCommerce Store API сайта
-(`/wp-json/wc/store/v1/products?orderby=date`): один лёгкий JSON-запрос, надёжнее
-парсинга HTML и бережно к сайту. **Зависимостей нет**, нужен только `python3`.
+**Прод крутится 24/7 на VPS** — не на GitHub Actions и не на локальном launchd
+(это ранние итерации, от них отказались).
+Координаты сервера и деплой → **[DEPLOY.md](DEPLOY.md)**.
+Полный контекст (архитектура, прайс-база, грабли, восстановление) → **[CONTEXT.md](CONTEXT.md)**.
 
-## Настройка (10 минут, один раз)
+## Локально погонять
 
-1. **Создать бота:** напиши [@BotFather](https://t.me/BotFather) → `/newbot` → получишь токен вида `123456:ABC...`.
-2. **Создать закрытый канал** в Telegram (или взять существующий).
-3. **Добавить бота в канал админом** с правом «Публикация сообщений».
-4. **Узнать ID канала:**
-   - опубликуй любой пост в канал;
-   - открой в браузере `https://api.telegram.org/bot<ТОКЕН>/getUpdates`;
-   - найди `"chat":{"id":-100...}` — это и есть `channel_id` (с минусом).
-5. **Заполнить конфиг:** скопируй `config.example.json` → `config.json`, впиши `bot_token` и `channel_id`.
-
-## Запуск
-
-Проверить, что данные тянутся (ничего не шлёт, печатает последние товары):
 ```
-python3 monitor.py --dry
+python3 monitor.py --dry [источник]   # превью без отправки: abel_new | abel_sold | moscow | antique
+python3 monitor.py --test             # по одной карточке из каждого источника в канал
+python3 monitor.py --snapshot         # обстрел прайс-базы + замер RAM
+python3 monitor.py --loop             # боевой цикл (так же запускается на сервере)
 ```
-
-Проверить доставку в канал (шлёт последний товар принудительно, разово):
-```
-python3 monitor.py --test
-```
-
-Первый боевой запуск — помечает текущие товары как «уже виденные», ничего не шлёт:
-```
-python3 monitor.py
-```
-
-Дальше каждый запуск шлёт только то, что появилось с прошлого раза.
-
-## Автозапуск каждые 15 минут (macOS, launchd)
-
-1. Пути в `com.user.abel-monitor.plist` уже под `~/Desktop/abel-monitor/` — поправь, если перенесёшь.
-2. `cp com.user.abel-monitor.plist ~/Library/LaunchAgents/`
-3. `launchctl load ~/Library/LaunchAgents/com.user.abel-monitor.plist`
-4. Логи — `monitor.log` / `monitor.err.log` рядом со скриптом.
-   Снять: `launchctl unload ~/Library/LaunchAgents/com.user.abel-monitor.plist`
-
-Альтернатива — гонять демоном в терминале: `python3 monitor.py --loop`.
+Нужен `config.json` (скопировать из `config.example.json`, вписать `bot_token`,
+`channel_id`, `telegram_proxy`).
 
 ## Файлы
-- `monitor.py` — скрипт
-- `config.json` — токен и канал (в `.gitignore`, не коммитить)
-- `seen_ids.json` — память о виденных товарах (создаётся сама)
-
-## Заметки
-- Интервал — `interval_seconds` (по умолчанию 900 = 15 мин). Магазин антикварный,
-  новинок немного — чаще дёргать сайт незачем.
-- За проход ловится до `per_page` (50) новинок. Больше за один интервал для
-  антиквариата нереально.
+- `monitor.py` — весь код
+- `config.json` — токен/канал/прокси (в `.gitignore`, не коммитить)
+- `books.csv` — прайс-база для цен проданного (в `.gitignore`, ведётся на сервере)
+- `state.json` — что уже отправлено
+- `CONTEXT.md`, `DEPLOY.md` — контекст проекта и деплой
