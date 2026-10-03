@@ -3,7 +3,9 @@
 
 Источники (у каждого свой интервал опроса):
   abel_new   — новые поступления abelbooks.ru (в наличии)         — 5 мин
-  abel_sold  — проданные на abelbooks.ru (diff набора проданных)  — 1 час
+  abel_sold  — проданные на abelbooks.ru (diff «Нет в наличии»)   — 1 час
+  (abelbooks с 24.09.2026 на Битриксе: парсим HTML каталога, сортировка new_desc —
+   сначала книги в наличии по убыванию id, в хвосте — «Нет в наличии»)
   moscow     — букинист moscowbooks.ru по фильтру (год/неделя)    — 5 мин
   antique    — новые поступления antiquebooks.ru                  — 1 час
 
@@ -37,7 +39,8 @@ BOOK_FIELDS = ["id", "title", "price", "first_seen", "status", "sold_date", "day
 TG_PROXY = None
 BOOKS = {}  # id -> запись прайс-базы (см. BOOK_FIELDS); наполняется из abel в наличии
 
-ABEL_API = "https://abelbooks.ru/wp-json/wc/store/v1/products"
+ABEL_HOST = "https://abelbooks.ru"
+ABEL_CATALOG = ABEL_HOST + "/kategoriya/?sort=new_desc"
 MOSCOW_HOST = "https://www.moscowbooks.ru"
 MOSCOW_URL = MOSCOW_HOST + "/bookinist/?yf=1940&date_in=week"
 ANTIQUE_HOST = "https://antiquebooks.ru"
@@ -72,77 +75,71 @@ def http_get(url, binary=False, retries=2):
             req = urllib.request.Request(url, headers={"User-Agent": UA})
             with urllib.request.urlopen(req, timeout=45) as r:
                 return r.read() if binary else r.read().decode("utf-8")
-        except urllib.error.HTTPError:
-            raise
+        except urllib.error.HTTPError as e:
+            if e.code < 500:
+                raise
+            last = e  # Битрикс abelbooks изредка отдаёт 500 — повторим
+            time.sleep(5)
         except OSError as e:  # таймаут/сетевой сбой — повторим
             last = e
             time.sleep(2)
     raise last
 
 
-def abel_api(params):
-    return json.loads(http_get(f"{ABEL_API}?{urllib.parse.urlencode(params)}"))
+def abel_page(page):
+    """Страница каталога → (карточки, номер последней страницы). Карточка — item + флаг sold."""
+    doc = http_get(ABEL_CATALOG if page == 1 else f"{ABEL_CATALOG}&PAGEN_1={page}")
+    last = max(map(int, re.findall(r'PAGEN_1=(\d+)', doc)), default=page)
+    cards = []
+    for b in re.split(r'<div class="catalog-card" ', doc)[1:]:
+        m = re.search(r'data-id="(\d+)"', b)
+        if not m:
+            continue
+        name = re.search(r'data-name="([^"]*)"', b)
+        price = re.search(r'data-price="(\d+)', b)
+        href = re.search(r'href="(/product/[^"]+)"', b)
+        imgm = re.search(r'<img[^>]*\bsrc="(/upload/[^"]+)"', b)
+        url = ABEL_HOST + href.group(1) if href else ABEL_HOST + "/"
+        cards.append({
+            "id": m.group(1),
+            "title": html.unescape(name.group(1)) if name and name.group(1) else "Без названия",
+            "price": f"{int(price.group(1)):,}".replace(",", " ") + " ₽" if price and int(price.group(1)) else None,
+            "url": url,
+            "cover_page": url if href else None,
+            "images": [ABEL_HOST + imgm.group(1)] if imgm else [],
+            "sold": "_not_avail\"" in b,
+        })
+    return cards, last
 
 
 # ---------- источники: каждый возвращает список item ----------
 # item = {id, title, price, url, tag, images:[url,...]}
 
-def _abel_images(images):
-    if not images:
-        return []
-    img = images[0]
-    sized = []
-    for tok in (img.get("srcset") or "").split(","):
-        u, _, w = tok.strip().rpartition(" ")
-        if w.endswith("w") and w[:-1].isdigit():
-            sized.append((int(w[:-1]), u))
-    order = [u for _, u in sorted((c for c in sized if c[0] <= 1280), key=lambda x: -x[0])]
-    for extra in (img.get("thumbnail"), img.get("src")):
-        if extra and extra not in order:
-            order.append(extra)
-    return order
-
-
-def _abel_price(p):
-    prices = p.get("prices") or {}
-    price = prices.get("price")
-    minor = prices.get("currency_minor_unit", 0) or 0
-    if price in (None, ""):
-        return None
-    val = int(price) / (10 ** minor) if minor else int(price)
-    if not val:  # у проданных цена обнулена в 0
-        return None
-    return f"{val:,.0f}".replace(",", " ") + f" {prices.get('currency_symbol', '₽')}"
-
-
-def _abel_item(p, tag):
-    return {
-        "id": str(p["id"]),
-        "title": html.unescape(p.get("name") or "Без названия"),
-        "price": _abel_price(p),
-        "url": p.get("permalink") or "https://abelbooks.ru/",
-        "tag": tag,
-        "images": _abel_images(p.get("images") or []),
-    }
-
-
 def source_abel_new():
-    products = abel_api({"orderby": "date", "order": "desc", "per_page": 50, "stock_status": "instock"})
-    return [_abel_item(p, "Абель – в продаже") for p in products]
+    """Новые сверху. Листаем дальше, пока вся страница незнакома прайс-базе (пачка загрузок)."""
+    items, page = [], 1
+    while page <= 5:
+        cards, _ = abel_page(page)
+        instock = [c for c in cards if not c["sold"]]
+        items += [dict(c, tag="Абель – в продаже") for c in instock]
+        if not instock or len(instock) < len(cards) or any(c["id"] in BOOKS for c in instock):
+            break
+        page += 1
+        time.sleep(1)
+    return items
 
 
 def source_abel_sold():
-    items, page = [], 1
-    while page <= 30:
-        batch = abel_api({"orderby": "date", "order": "desc", "per_page": 100,
-                          "stock_status": "outofstock", "page": page})
-        if not batch:
+    """Проданные — хвост каталога: идём с последней страницы назад, пока страница целиком «Нет в наличии»."""
+    _, page = abel_page(1)
+    items = []
+    while page >= 1:
+        cards, _ = abel_page(page)
+        items += [dict(c, tag="Абель – продано") for c in cards if c["sold"]]
+        if not cards or not all(c["sold"] for c in cards):
             break
-        items += [_abel_item(p, "Абель – продано") for p in batch]
-        if len(batch) < 100:
-            break
-        page += 1
-        time.sleep(0.3)
+        page -= 1
+        time.sleep(0.5)
     return items
 
 
@@ -275,18 +272,15 @@ def enrich_sold(items):
 def refresh_books():
     """Снимок всех книг в наличии → пополнение прайс-базы (первичный обстрел и раз в сутки)."""
     total, page = 0, 1
-    while page <= 40:
-        batch = abel_api({"orderby": "date", "order": "desc", "per_page": 100, "stock_status": "instock", "page": page})
-        if not batch:
-            break
-        record_instock([{"id": str(p["id"]),
-                         "title": html.unescape(p.get("name") or "Без названия"),
-                         "price": _abel_price(p) or ""} for p in batch])  # только цены, без картинок
-        total += len(batch)
-        if len(batch) < 100:
+    while page <= 300:
+        cards, last = abel_page(page)
+        instock = [c for c in cards if not c["sold"]]
+        record_instock(instock)
+        total += len(instock)
+        if len(instock) < len(cards) or page >= last:
             break
         page += 1
-        time.sleep(0.3)
+        time.sleep(0.5)
     save_books()
     return total
 
@@ -328,13 +322,24 @@ def tg_call(token, method, data):
         return json.loads(r.read().decode("utf-8"))
 
 
+def _image_type(data):
+    if data[:3] == b"\xff\xd8\xff":
+        return "jpg", "image/jpeg"
+    if data[:4] == b"\x89PNG":
+        return "png", "image/png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":  # abelbooks отдаёт только webp
+        return "webp", "image/webp"
+    return None
+
+
 def _send_photo(token, chat, caption, data):
+    ext, mime = _image_type(data)
     b = "----book" + os.urandom(8).hex()
     def part(name, value):
         return (f'--{b}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n').encode("utf-8")
     body = part("chat_id", chat) + part("caption", caption[:1024]) + part("parse_mode", "HTML")
     body += (f'--{b}\r\nContent-Disposition: form-data; name="photo"; '
-             f'filename="cover.jpg"\r\nContent-Type: image/jpeg\r\n\r\n').encode("utf-8")
+             f'filename="cover.{ext}"\r\nContent-Type: {mime}\r\n\r\n').encode("utf-8")
     body += data + b"\r\n" + f"--{b}--\r\n".encode("utf-8")
     req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendPhoto", data=body,
                                  headers={"Content-Type": f"multipart/form-data; boundary={b}"})
@@ -344,18 +349,27 @@ def _send_photo(token, chat, caption, data):
 
 def notify(token, chat, item):
     text = format_message(item)
-    for url in item.get("images") or []:
+    images = list(item.get("images") or [])
+    if item.get("cover_page"):  # в листинге превью 306px — крупную обложку берём из og:image товара
+        try:
+            m = re.search(r'og:image"\s+content="([^"]+)"', http_get(item["cover_page"]))
+            if m:
+                images.insert(0, m.group(1))
+        except Exception:
+            pass
+    for url in images:
         try:
             data = http_get(url, binary=True)
         except Exception:
             continue
-        if data[:3] != b"\xff\xd8\xff" and data[:4] != b"\x89PNG":  # не картинка (заглушка)
+        if not _image_type(data):  # не картинка (заглушка)
             continue
         try:
             if _send_photo(token, chat, text, data).get("ok"):
                 return
-        except urllib.error.HTTPError:
-            continue  # размер/пропорции не подошли — пробуем следующий
+        except urllib.error.HTTPError as e:
+            print(f"sendPhoto {e.code} {url}", file=sys.stderr)
+            continue  # размер/пропорции/формат не подошли — пробуем следующий
     tg_call(token, "sendMessage", {"chat_id": chat, "text": text, "parse_mode": "HTML",
                                    "disable_web_page_preview": "true"})
 
