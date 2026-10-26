@@ -54,20 +54,32 @@ Workflow в `.github/workflows/monitor.yml` оставлен только под
 
 ## Апдейт кода
 
-Локально: правки `monitor.py` → `git pull --rebase` → `git commit && git push`.
+Локально: правки → `python3 -B -m unittest -v test_monitor` → commit/push.
 На сервере:
 ```
 cd /root/book-monitor
-cp -f state.json /root/state.backup.json
-git fetch -q origin main && git reset --hard -q origin/main
-cp -f /root/state.backup.json state.json
-systemctl restart book-monitor
+systemctl stop book-monitor
+backup=/root/book-monitor-backup-$(date -u +%Y%m%dT%H%M%SZ)
+mkdir -m 700 "$backup"
+cp -a monitor.py state.json books.csv config.json "$backup"/
+[ ! -f abel_state.json ] || cp -a abel_state.json "$backup"/
+git fetch -q origin main && git merge --ff-only origin/main
+systemctl start book-monitor
 ```
-`config.json` и `books.csv` в `.gitignore` → `reset --hard` их не трогает.
-Подмена самой `books.csv`: `systemctl stop` → scp → `start` (живая служба иначе перезапишет файл из памяти).
+При ошибке обновления восстановить прежний код из backup и запустить службу.
+`config.json`, `books.csv` и `abel_state.json` — рабочие данные вне Git.
+`state.json` отслеживается Git, но обновление кода его не меняет.
+Подмена данных: `systemctl stop` → копирование → `start` (служба иначе перезапишет их).
+
+С 26.10 Абель обходит весь каталог примерно каждые 5 минут, два запроса параллельно.
+Первый запуск без `abel_state.json` запоминает каталог молча; дальнейшие запуски
+используют сохранённую историю и очередь доставки. Не удалять этот файл при
+обновлении. Проверка снимка и ожидающих событий без отправки и записи:
+`python3 monitor.py --abel-preview`.
 
 ## Восстановление, если сервер умрёт
 
-Локальная папка = полный бэкап (код + `config.json` + `books.csv` + `state.json`).
+Нужен свежий серверный бэкап: код + `config.json` + `books.csv` + `state.json` +
+`abel_state.json`. Перенос локальных файлов от 25.10 не содержит новую историю.
 Новый VPS (лучше **зарубежный** — TG без обходов) → скопировать папку целиком → тот же
 юнит → `systemctl start`. Продолжит с места, без пересева и без спама «старыми» новинками.

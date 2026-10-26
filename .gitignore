@@ -1,5 +1,7 @@
 config.json
 books.csv
+abel_state.json
+*.tmp
 *.log
 .venv/
 __pycache__/

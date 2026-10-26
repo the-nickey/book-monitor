@@ -2,8 +2,7 @@
 """Монитор книжных новинок и продаж → закрытый Telegram-канал.
 
 Источники (у каждого свой интервал опроса):
-  abel_new   — новые поступления abelbooks.ru (в наличии)         — 5 мин
-  abel_sold  — проданные на abelbooks.ru (diff «Нет в наличии»)   — 1 час
+   abel       — полный каталог abelbooks.ru, поступления/продажи  — 5 мин
   (abelbooks с 24.09.2026 на Битриксе: парсим HTML каталога, сортировка new_desc —
    сначала книги в наличии по убыванию id, в хвосте — «Нет в наличии»)
   moscow     — букинист moscowbooks.ru по фильтру (год/неделя)    — 5 мин
@@ -11,11 +10,12 @@
 
 Прайс-база (books.csv): цена проданного обнуляется сайтом, поэтому запоминаем
 цену книги, пока она в наличии; при продаже подставляем её + считаем, сколько
-дней книга провисела (first_seen → sold_date).
+    дней книга провисела. История повторных поступлений — abel_state.json.
 
-К сайтам ходим напрямую под браузерным UA; в Telegram — через HTTP-прокси.
+ К сайтам ходим напрямую под браузерным UA; Telegram поддерживает опциональный прокси.
 """
 import csv
+import copy
 import html
 import json
 import os
@@ -26,7 +26,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import date
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -35,6 +36,7 @@ HERE = Path(__file__).resolve().parent
 STATE_FILE = HERE / "state.json"
 CONFIG_FILE = HERE / "config.json"
 BOOKS_FILE = HERE / "books.csv"
+ABEL_STATE_FILE = HERE / "abel_state.json"
 BOOK_FIELDS = ["id", "title", "price", "first_seen", "status", "sold_date", "days_on_shelf"]
 TG_PROXY = None
 BOOKS = {}  # id -> запись прайс-базы (см. BOOK_FIELDS); наполняется из abel в наличии
@@ -112,35 +114,40 @@ def abel_page(page):
     return cards, last
 
 
+def abel_original_image(url):
+    return re.sub(r'/upload/resize_cache/iblock/([^/]+)/([^/]+)/\d+_\d+_\d+/',
+                  r'/upload/iblock/\1/\2/', url)
+
+
 # ---------- источники: каждый возвращает список item ----------
 # item = {id, title, price, url, tag, images:[url,...]}
 
-def source_abel_new():
-    """Новые сверху. Листаем дальше, пока вся страница незнакома прайс-базе (пачка загрузок)."""
-    items, page = [], 1
-    while page <= 5:
-        cards, _ = abel_page(page)
-        instock = [c for c in cards if not c["sold"]]
-        items += [dict(c, tag="Абель – в продаже") for c in instock]
-        if not instock or len(instock) < len(cards) or any(c["id"] in BOOKS for c in instock):
-            break
-        page += 1
-        time.sleep(1)
-    return items
+def source_abel():
+    """Полный каталог: старый ID при возврате не поднимается в начало списка.
 
+    Два работника ограничивают RAM и нагрузку; неполный/сломанный ответ не
+    превращается в наблюдение. Отсутствие ID само по себе не считается продажей.
+    """
+    first, last = abel_page(1)
+    if not first or not 1 <= last <= 300:
+        raise ValueError("Абель: пустая или некорректная первая страница")
 
-def source_abel_sold():
-    """Проданные — хвост каталога: идём с последней страницы назад, пока страница целиком «Нет в наличии»."""
-    _, page = abel_page(1)
-    items = []
-    while page >= 1:
-        cards, _ = abel_page(page)
-        items += [dict(c, tag="Абель – продано") for c in cards if c["sold"]]
-        if not cards or not all(c["sold"] for c in cards):
-            break
-        page -= 1
+    def fetch(page):
         time.sleep(0.5)
-    return items
+        cards, _ = abel_page(page)
+        if not cards:
+            raise ValueError(f"Абель: пустая страница {page}, снимок отменён")
+        return cards
+
+    cards = {c["id"]: c for c in first}
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for batch in pool.map(fetch, range(2, last + 1)):
+            for card in batch:
+                old = cards.get(card["id"])
+                if old and old["sold"] != card["sold"]:
+                    raise ValueError("Абель: наличие изменилось во время обхода, повторим снимок")
+                cards[card["id"]] = card
+    return list(cards.values())
 
 
 def source_moscow():
@@ -211,8 +218,7 @@ def source_antique():
 
 # имя → (функция, интервал опроса в секундах по умолчанию)
 SOURCES = {
-    "abel_new":  {"fn": source_abel_new,  "interval": 300},
-    "abel_sold": {"fn": source_abel_sold, "interval": 3600},
+    "abel":      {"fn": source_abel,      "interval": 300},
     "moscow":    {"fn": source_moscow,    "interval": 300},
     "antique":   {"fn": source_antique,   "interval": 3600},
 }
@@ -228,10 +234,12 @@ def load_books():
 
 
 def save_books():
-    with open(BOOKS_FILE, "w", newline="", encoding="utf-8") as f:
+    tmp = BOOKS_FILE.with_suffix(".csv.tmp")
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=BOOK_FIELDS)
         w.writeheader()
         w.writerows(BOOKS.values())
+    tmp.replace(BOOKS_FILE)
 
 
 def record_instock(items):
@@ -285,6 +293,139 @@ def refresh_books():
     return total
 
 
+# ---------- Абель: состояния, история и очередь доставки ----------
+
+def save_json(path, value):
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(value, f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    tmp.replace(path)
+
+
+def load_abel_state():
+    if not ABEL_STATE_FILE.exists():
+        return None
+    data = json.loads(ABEL_STATE_FILE.read_text("utf-8"))
+    if (data.get("version") != 1 or not isinstance(data.get("items"), dict) or not data["items"]
+            or not isinstance(data.get("pending"), list) or not isinstance(data.get("next_event"), int)):
+        raise ValueError("Некорректный abel_state.json; автоматический пересев запрещён")
+    return data
+
+
+def observe_abel(items, previous, books, today=None, observed_at=None):
+    """Чистая подготовка снимка/событий: без записи файлов и отправки сообщений."""
+    today = today or date.today().isoformat()
+    observed_at = observed_at or datetime.now(timezone.utc).isoformat()
+    baseline = previous is None
+    data = copy.deepcopy(previous) if previous is not None else {
+        "version": 1, "items": {}, "pending": [], "next_event": 1,
+    }
+    if not items:
+        raise ValueError("Абель: пустой снимок, состояние сохранено")
+    for item in items:
+        pid = item["id"]
+        old = data["items"].get(pid)
+        legacy = books.get(pid, {})
+        status = "sold" if item["sold"] else "instock"
+        returned = old is not None and old["status"] == "sold" and status == "instock"
+        cycle = (old or {}).get("cycle", 0) + (1 if returned or (old is None and status == "instock") else 0)
+        # Цена старого экземпляра не выдаётся за цену нового поступления.
+        price = item.get("price")
+        if not price and not returned:
+            price = (old or {}).get("price") or (legacy.get("price") if baseline or old is None else None)
+        cycle_started = (old or {}).get("cycle_started", "")
+        if returned or (old is None and status == "instock"):
+            cycle_started = (legacy.get("first_seen") or today) if baseline and legacy.get("status") == "instock" else today
+        elif baseline and legacy.get("first_seen"):
+            cycle_started = legacy["first_seen"]
+        first_seen = (old or {}).get("first_seen") or legacy.get("first_seen") or (today if status == "instock" else "")
+        current = {
+            "status": status, "title": item["title"], "url": item["url"],
+            "price": price or "", "images": [abel_original_image(url) for url in item.get("images") or []],
+            "first_seen": first_seen, "cycle_started": cycle_started, "cycle": cycle,
+            "observed_at": observed_at,
+            "sold_date": today if status == "sold" and (old is None or old["status"] != "sold") else (old or {}).get("sold_date", ""),
+            "history": list((old or {}).get("history", [])),
+        }
+        if not current["images"] and old and not returned:
+            current["images"] = list(old["images"])
+        if status == "instock":
+            current["sold_date"] = ""
+        elif baseline and legacy.get("sold_date"):
+            current["sold_date"] = legacy["sold_date"]
+        price_changed = bool(old and price and old["price"] != price)
+        # Пропавшая картинка в одном ответе не считается заменой фотографии.
+        photo_changed = bool(old and old["images"] and current["images"] and old["images"] != current["images"])
+        changed = old is None or old["status"] != status or price_changed or photo_changed
+        if changed:
+            current["history"].append({
+                "at": observed_at, "status": status, "price": current["price"],
+                "images": current["images"], "cycle": cycle,
+            })
+        tag = None
+        if not baseline:
+            if returned:
+                tag = "Абель – снова в продаже"
+            elif status == "sold" and (old is None or old["status"] != "sold"):
+                tag = "Абель – продано"
+            elif status == "instock" and old is None:
+                tag = "Абель – в продаже"
+            elif status == "instock" and (price_changed or photo_changed):
+                tag = "Абель – " + ("изменилась цена и фото" if price_changed and photo_changed else "изменилась цена" if price_changed else "обновлено фото")
+        if tag:
+            event = dict(item, tag=tag, price=price, images=current["images"], cover_page=item["url"],
+                         first_seen=cycle_started if status == "sold" else "",
+                         price_unknown="Цена не сохранена" if status == "sold" else "Цена не указана")
+            if price_changed:
+                event["previous_price"] = old["price"]
+            data["pending"].append({"id": data["next_event"], "item": event, "observed_at": observed_at})
+            data["next_event"] += 1
+        data["items"][pid] = current
+    data["updated_at"] = observed_at
+    return data
+
+
+def sync_abel_books(data):
+    """Совместимая CSV-проекция; история циклов остаётся в abel_state.json."""
+    for pid, item in data["items"].items():
+        days = ""
+        if item["status"] == "sold" and item["cycle_started"] and item["sold_date"]:
+            days = str(max(0, (date.fromisoformat(item["sold_date"]) - date.fromisoformat(item["cycle_started"][:10])).days))
+        BOOKS[pid] = {
+            "id": pid, "title": item["title"], "price": item["price"],
+            "first_seen": item["first_seen"], "status": item["status"],
+            "sold_date": item["sold_date"], "days_on_shelf": days,
+        }
+
+
+def check_abel(fetch, token, chat, state):
+    old = load_abel_state()
+    data = observe_abel(fetch(), old, BOOKS)
+    # Сначала сохраняем наблюдения и очередь, затем доставляем. Ошибка Telegram
+    # и рестарт процесса не теряют событие и цену предыдущего цикла.
+    save_json(ABEL_STATE_FILE, data)
+    sync_abel_books(data)
+    save_books()
+    for name, status in [("abel_new", "instock"), ("abel_sold", "sold")]:
+        state[name] = set(state.get(name, [])) | {pid for pid, it in data["items"].items() if it["status"] == status}
+    save_state(state)
+    sent = 0
+    for event in list(data["pending"]):
+        try:
+            notify(token, chat, event["item"])
+        except Exception as e:
+            print(f"[abel] send error {event['item']['id']}: {e}", file=sys.stderr)
+            break  # сохраняем порядок циклов при недоступном Telegram
+        data["pending"].remove(event)
+        save_json(ABEL_STATE_FILE, data)
+        sent += 1
+        time.sleep(1)
+    print(f"[{stamp()}] [abel] карточек: {len(data['items'])}, в очереди: {len(data['pending'])}")
+    return sent, old is None
+
+
 # ---------- Telegram (через прокси) ----------
 
 def _tg_open(req, timeout):
@@ -300,6 +441,10 @@ def format_message(item):
     extras = []
     if item.get("price"):
         extras.append(html.escape(item["price"]))
+    elif item.get("price_unknown"):
+        extras.append(html.escape(item["price_unknown"]))
+    if item.get("previous_price"):
+        extras.append("раньше " + html.escape(item["previous_price"]))
     fs = item.get("first_seen")
     if fs:
         iso = fs[:10]  # обе формы (ISO и пометка «2026-07-04 – …») начинаются с даты
@@ -347,14 +492,31 @@ def _send_photo(token, chat, caption, data):
         return json.loads(r.read().decode("utf-8"))
 
 
+def abel_cover_images(doc):
+    # og:image бывает устаревшей миниатюрой прежнего экземпляра. Битрикс PICT
+    # содержит основную фотографию текущей галереи в исходном разрешении.
+    images = []
+    main = re.search(r"'PICT'\s*:\s*\{[^}]*'SRC'\s*:\s*'([^']+)'", doc)
+    if main:
+        images.append(urllib.parse.urljoin(ABEL_HOST, html.unescape(main.group(1))))
+    og = re.search(r'og:image"\s+content="([^"]+)"', doc)
+    if og:
+        images.append(html.unescape(og.group(1)))
+    return images
+
+
 def notify(token, chat, item):
     text = format_message(item)
     images = list(item.get("images") or [])
-    if item.get("cover_page"):  # в листинге превью 306px — крупную обложку берём из og:image товара
+    snapshot_images = [abel_original_image(url) for url in images
+                       if "/upload/resize_cache/iblock/" in url or "/upload/iblock/" in url]
+    if item.get("cover_page") and snapshot_images:
+        # У очереди может быть несколько циклов одного ID. Берём фото именно
+        # зафиксированного события, а не экземпляра, который сейчас на странице.
+        images = list(dict.fromkeys(snapshot_images + images))
+    elif item.get("cover_page"):
         try:
-            m = re.search(r'og:image"\s+content="([^"]+)"', http_get(item["cover_page"]))
-            if m:
-                images.insert(0, m.group(1))
+            images = abel_cover_images(http_get(item["cover_page"])) + images
         except Exception:
             pass
     for url in images:
@@ -370,18 +532,16 @@ def notify(token, chat, item):
         except urllib.error.HTTPError as e:
             print(f"sendPhoto {e.code} {url}", file=sys.stderr)
             continue  # размер/пропорции/формат не подошли — пробуем следующий
-    tg_call(token, "sendMessage", {"chat_id": chat, "text": text, "parse_mode": "HTML",
-                                   "disable_web_page_preview": "true"})
+    response = tg_call(token, "sendMessage", {"chat_id": chat, "text": text, "parse_mode": "HTML",
+                                             "disable_web_page_preview": "true"})
+    if not response.get("ok"):
+        raise RuntimeError("Telegram отклонил сообщение: " + str(response.get("description", "unknown error")))
 
 
 def check_source(name, fetch, token, chat, state):
+    if name == "abel":
+        return check_abel(fetch, token, chat, state)
     items = fetch()
-    if name == "abel_new":
-        record_instock(items)
-        save_books()
-    elif name == "abel_sold":
-        enrich_sold(items)  # фиксирует делистинги и подставляет цену/дни
-        save_books()
     first_run = name not in state
     seen = set(state.get(name, []))
     fresh = [it for it in items if it["id"] not in seen]
@@ -409,7 +569,7 @@ def load_state():
 
 
 def save_state(state):
-    STATE_FILE.write_text(json.dumps({k: sorted(v) for k, v in state.items()}, ensure_ascii=False), "utf-8")
+    save_json(STATE_FILE, {k: sorted(v) for k, v in state.items()})
 
 
 def check_once(token, chat, state):
@@ -425,29 +585,20 @@ def check_once(token, chat, state):
 
 
 def run_loop(token, chat, state):
-    """Источники — по своим интервалам + джиттер. Прайс-база: первичный обстрел
-    (если пустая) и снимок раз в сутки."""
+    """Полный снимок Абеля и остальные источники по своим интервалам."""
     due = {name: 0.0 for name in SOURCES}
-    snap_due = 0.0 if not BOOKS else time.time() + 86400
     while True:
-        now = time.time()
-        if now >= snap_due:
-            try:
-                n = refresh_books()
-                print(f"[{stamp()}] [books] снимок цен: {n} в наличии, {len(BOOKS)} всего в базе")
-            except Exception as e:
-                print(f"[{stamp()}] [books] ошибка снимка: {e}", file=sys.stderr)
-            snap_due = time.time() + 86400 * random.uniform(0.9, 1.1)
         for name, meta in SOURCES.items():
-            if now < due[name]:
+            if time.time() < due[name]:
                 continue
+            started = time.time()
             try:
                 n, first = check_source(name, meta["fn"], token, chat, state)
                 print(f"[{stamp()}] [{name}] " + (f"seed {n} (без отправки)" if first else f"новых: {n}"))
             except Exception as e:
                 print(f"[{stamp()}] [{name}] ошибка источника: {e}", file=sys.stderr)
-            due[name] = time.time() + meta["interval"] * random.uniform(0.9, 1.1)
-        time.sleep(random.uniform(45, 75))
+            due[name] = max(time.time() + 15, started + meta["interval"] * random.uniform(0.9, 1.1))
+        time.sleep(random.uniform(15, 25))
 
 
 def main():
@@ -456,6 +607,10 @@ def main():
     token, chat, proxy, intervals = load_config()
     TG_PROXY = proxy
     for name, sec in intervals.items():
+        if name == "abel_new":
+            name = "abel"
+        elif name == "abel_sold":
+            continue  # поступления и продажи теперь используют один снимок
         if name in SOURCES:
             SOURCES[name]["interval"] = int(sec)
     BOOKS = load_books()
@@ -469,12 +624,27 @@ def main():
         return
 
     if "--dry" in argv:
-        which = next((a for a in argv if a in SOURCES), None)
+        which = next((a for a in argv if a in SOURCES or a in ("abel_new", "abel_sold")), None)
         for name in ([which] if which else list(SOURCES)):
-            items = SOURCES[name]["fn"]()
+            if name in ("abel", "abel_new", "abel_sold"):
+                items = source_abel()
+                items = [dict(it, tag="Абель – продано" if it["sold"] else "Абель – в продаже",
+                              price_unknown="Цена не сохранена" if it["sold"] else "Цена не указана") for it in items
+                         if name == "abel" or it["sold"] == (name == "abel_sold")]
+                enrich_sold([it for it in items if it["sold"]])
+            else:
+                items = SOURCES[name]["fn"]()
             print(f"### {name}: {len(items)} позиций")
             for it in items[:5]:
                 print(format_message(it) + "\n---")
+        return
+
+    if "--abel-preview" in argv:
+        previous = load_abel_state()
+        data = observe_abel(source_abel(), previous, BOOKS)
+        print(f"Абель: {len(data['items'])} карточек, baseline={previous is None}, очередь={len(data['pending'])}")
+        for event in data["pending"]:
+            print(format_message(event["item"]))
         return
 
     if not token or not chat:
@@ -485,7 +655,13 @@ def main():
             try:
                 items = meta["fn"]()
                 if items:
-                    notify(token, chat, items[0])
+                    item = items[0]
+                    if name == "abel":
+                        item = dict(item, tag="Абель – продано" if item["sold"] else "Абель – в продаже",
+                                    cover_page=item["url"], price_unknown="Цена не сохранена" if item["sold"] else "Цена не указана")
+                        if item["sold"]:
+                            enrich_sold([item])
+                    notify(token, chat, item)
                     time.sleep(1)
                     print(f"[{name}] тест отправлен: {items[0]['title'][:50]}")
             except Exception as e:
