@@ -24,6 +24,7 @@ import os
 import random
 import re
 import socket
+import ssl
 import sys
 import time
 import urllib.error
@@ -74,6 +75,46 @@ def load_config():
     return token, chat, proxy, cfg.get("intervals") or {}
 
 
+class ForwardedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host, *, local_port, **kwargs):
+        super().__init__(host, **kwargs)
+        self.local_port = local_port
+        self._create_connection = self._dial_forward
+
+    def _dial_forward(self, _address, timeout, source_address):
+        return socket.create_connection(("127.0.0.1", self.local_port), timeout, source_address)
+
+    def connect(self):
+        if self.host != "api.telegram.org":
+            return super().connect()
+
+        request_timeout = self.timeout
+        socket_timeout = socket.getdefaulttimeout()
+        if request_timeout is None or isinstance(request_timeout, (int, float)):
+            socket_timeout = request_timeout
+        self.timeout = 7 if socket_timeout is None else min(socket_timeout, 7)
+        # connect() runs before request bytes are sent. A failed TLS handshake is safe to retry.
+        routes = (self._dial_forward, socket.create_connection, self._dial_forward)
+        try:
+            for attempt, dial in enumerate(routes, 1):
+                self._create_connection = dial
+                try:
+                    super().connect()
+                except (TimeoutError, ConnectionError, ssl.SSLEOFError):
+                    if self.sock is not None:
+                        self.sock.close()
+                        self.sock = None
+                    if attempt == len(routes):
+                        raise
+                    print("Telegram: повтор подключения до отправки запроса", file=sys.stderr)
+                else:
+                    self.sock.settimeout(socket_timeout)
+                    return
+        finally:
+            self.timeout = request_timeout
+            self._create_connection = self._dial_forward
+
+
 class ForwardedHTTPSHandler(urllib.request.HTTPSHandler):
     def __init__(self, forward_ports):
         super().__init__()
@@ -86,14 +127,7 @@ class ForwardedHTTPSHandler(urllib.request.HTTPSHandler):
             return super().https_open(req)
 
         def connect(host, **kwargs):
-            connection = http.client.HTTPSConnection(host, **kwargs)
-
-            def dial(_address, timeout, source_address):
-                return socket.create_connection(("127.0.0.1", local_port), timeout, source_address)
-
-            # Redirect the TCP connection while retaining the site's Host and TLS hostname.
-            connection._create_connection = dial
-            return connection
+            return ForwardedHTTPSConnection(host, local_port=local_port, **kwargs)
 
         return self.do_open(connect, req, context=self._context)
 

@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from urllib.error import HTTPError
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import monitor as m
 
@@ -21,7 +21,25 @@ def observe(items, state=None, books=None, day="2026-10-26"):
     return m.observe_abel(items, state, books or {}, today=day, observed_at=day + "T12:00:00+00:00")
 
 
-class TelegramRateLimitTests(unittest.TestCase):
+class TelegramDeliveryTests(unittest.TestCase):
+    def test_connection_falls_back_before_sending_and_restores_response_timeout(self):
+        connection = m.ForwardedHTTPSConnection("api.telegram.org", local_port=19445, timeout=60)
+        connection_attempts = []
+        ready_socket = Mock()
+
+        def connect(client):
+            connection_attempts.append((client._create_connection, client.timeout))
+            if len(connection_attempts) == 1:
+                raise TimeoutError("handshake")
+            client.sock = ready_socket
+
+        with patch.object(m.http.client.HTTPSConnection, "connect", autospec=True, side_effect=connect):
+            connection.connect()
+
+        self.assertEqual(connection_attempts, [(connection._dial_forward, 7), (m.socket.create_connection, 7)])
+        ready_socket.settimeout.assert_called_once_with(60)
+        self.assertEqual(connection.timeout, 60)
+
     def test_retries_the_same_request_after_telegram_delay(self):
         failure = HTTPError("", 429, "Too Many Requests", {}, BytesIO(b'{"parameters":{"retry_after":3}}'))
         request = object()
