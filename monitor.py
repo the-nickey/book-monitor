@@ -12,15 +12,18 @@
 цену книги, пока она в наличии; при продаже подставляем её + считаем, сколько
     дней книга провисела. История повторных поступлений — abel_state.json.
 
- К сайтам ходим напрямую под браузерным UA; Telegram поддерживает опциональный прокси.
+ К сайтам ходим под браузерным UA. Для Абеля и MoscowBooks можно указать
+ локальные порты SSH-перенаправления. Прокси Telegram настраивается отдельно.
 """
 import csv
 import copy
 import html
+import http.client
 import json
 import os
 import random
 import re
+import socket
 import sys
 import time
 import urllib.error
@@ -70,12 +73,54 @@ def load_config():
     return token, chat, proxy, cfg.get("intervals") or {}
 
 
+class SourceHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, forward_ports):
+        super().__init__()
+        self.forward_ports = forward_ports
+
+    def https_open(self, req):
+        url = urllib.parse.urlsplit(req.full_url)
+        local_port = self.forward_ports.get(url.hostname)
+        if local_port is None or url.port not in (None, 443):
+            return super().https_open(req)
+
+        def connect(host, **kwargs):
+            connection = http.client.HTTPSConnection(host, **kwargs)
+
+            def dial(_address, timeout, source_address):
+                return socket.create_connection(("127.0.0.1", local_port), timeout, source_address)
+
+            # Redirect the TCP connection while retaining the site's Host and TLS hostname.
+            connection._create_connection = dial
+            return connection
+
+        return self.do_open(connect, req, context=self._context)
+
+
+SOURCE_FORWARD_PORTS = {
+    host: int(os.environ[env_name])
+    for host, env_name in (
+        ("abelbooks.ru", "BOOK_MONITOR_ABEL_FORWARD_PORT"),
+        ("www.moscowbooks.ru", "BOOK_MONITOR_MOSCOW_FORWARD_PORT"),
+    )
+    if os.environ.get(env_name)
+}
+SOURCE_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), SourceHTTPSHandler(SOURCE_FORWARD_PORTS)
+) if SOURCE_FORWARD_PORTS else None
+
+
 def http_get(url, binary=False, retries=2):
     last = None
     for _ in range(retries + 1):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": UA})
-            with urllib.request.urlopen(req, timeout=45) as r:
+            open_url = urllib.request.urlopen
+            target = urllib.parse.urlsplit(url)
+            if (SOURCE_OPENER and target.scheme == "https"
+                    and target.hostname in SOURCE_FORWARD_PORTS and target.port in (None, 443)):
+                open_url = SOURCE_OPENER.open
+            with open_url(req, timeout=45) as r:
                 return r.read() if binary else r.read().decode("utf-8")
         except urllib.error.HTTPError as e:
             if e.code < 500:
