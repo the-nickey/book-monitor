@@ -42,6 +42,7 @@ BOOKS_FILE = HERE / "books.csv"
 ABEL_STATE_FILE = HERE / "abel_state.json"
 BOOK_FIELDS = ["id", "title", "price", "first_seen", "status", "sold_date", "days_on_shelf"]
 TG_PROXY = None
+TELEGRAM_SEND_INTERVAL = 3.2
 BOOKS = {}  # id -> запись прайс-базы (см. BOOK_FIELDS); наполняется из abel в наличии
 
 ABEL_HOST = "https://abelbooks.ru"
@@ -449,17 +450,7 @@ def sync_abel_books(data):
         }
 
 
-def check_abel(fetch, token, chat, state):
-    old = load_abel_state()
-    data = observe_abel(fetch(), old, BOOKS)
-    # Сначала сохраняем наблюдения и очередь, затем доставляем. Ошибка Telegram
-    # и рестарт процесса не теряют событие и цену предыдущего цикла.
-    save_json(ABEL_STATE_FILE, data)
-    sync_abel_books(data)
-    save_books()
-    for name, status in [("abel_new", "instock"), ("abel_sold", "sold")]:
-        state[name] = set(state.get(name, [])) | {pid for pid, it in data["items"].items() if it["status"] == status}
-    save_state(state)
+def deliver_abel_pending(data, token, chat):
     sent = 0
     for event in list(data["pending"]):
         try:
@@ -470,7 +461,24 @@ def check_abel(fetch, token, chat, state):
         data["pending"].remove(event)
         save_json(ABEL_STATE_FILE, data)
         sent += 1
-        time.sleep(1)
+        time.sleep(TELEGRAM_SEND_INTERVAL)
+    return sent
+
+
+def check_abel(fetch, token, chat, state):
+    old = load_abel_state()
+    sent = deliver_abel_pending(old, token, chat) if old is not None else 0
+    data = observe_abel(fetch(), old, BOOKS)
+    # Сначала сохраняем наблюдения и очередь, затем доставляем. Ошибка Telegram
+    # и рестарт процесса не теряют событие и цену предыдущего цикла.
+    save_json(ABEL_STATE_FILE, data)
+    sync_abel_books(data)
+    save_books()
+    for name, status in [("abel_new", "instock"), ("abel_sold", "sold")]:
+        state[name] = set(state.get(name, [])) | {pid for pid, it in data["items"].items() if it["status"] == status}
+    save_state(state)
+    if old is None or not old["pending"]:
+        sent += deliver_abel_pending(data, token, chat)
     print(f"[{stamp()}] [abel] карточек: {len(data['items'])}, в очереди: {len(data['pending'])}")
     return sent, old is None
 
@@ -616,7 +624,7 @@ def check_source(name, fetch, token, chat, state):
         if not first_run:
             try:
                 notify(token, chat, it)
-                time.sleep(1)
+                time.sleep(TELEGRAM_SEND_INTERVAL)
             except Exception as e:
                 print(f"[{name}] send error {it['id']}: {e}", file=sys.stderr)
                 if isinstance(e, urllib.error.HTTPError) and e.code == 429:

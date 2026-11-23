@@ -155,6 +155,20 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(m.load_abel_state()["pending"], [])
         self.assertEqual(m.load_books()["16688"]["price"], "15 000 ₽")
 
+    def test_pending_delivery_can_succeed_while_catalog_is_unavailable(self):
+        old = observe([card(sold=True)])
+        pending = observe([card()], old)
+        m.save_json(m.ABEL_STATE_FILE, pending)
+
+        def fail_fetch():
+            raise OSError("catalog unavailable")
+
+        with patch.object(m, "notify") as notify:
+            with self.assertRaises(OSError):
+                m.check_abel(fail_fetch, "test", "test", {})
+        notify.assert_called_once()
+        self.assertEqual(m.load_abel_state()["pending"], [])
+
     def test_corrupt_state_fails_instead_of_silent_reseed(self):
         m.ABEL_STATE_FILE.write_text('{"version": 2, "items": {}}')
         with self.assertRaises(ValueError):
