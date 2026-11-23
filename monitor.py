@@ -12,8 +12,8 @@
 цену книги, пока она в наличии; при продаже подставляем её + считаем, сколько
     дней книга провисела. История повторных поступлений — abel_state.json.
 
- К сайтам ходим под браузерным UA. Для Абеля и MoscowBooks можно указать
- локальные порты SSH-перенаправления. Прокси Telegram настраивается отдельно.
+ К сайтам ходим под браузерным UA. Для Абеля, MoscowBooks и Telegram можно
+ указать локальные порты SSH-перенаправления. Telegram также поддерживает HTTP-прокси.
 """
 import csv
 import copy
@@ -73,7 +73,7 @@ def load_config():
     return token, chat, proxy, cfg.get("intervals") or {}
 
 
-class SourceHTTPSHandler(urllib.request.HTTPSHandler):
+class ForwardedHTTPSHandler(urllib.request.HTTPSHandler):
     def __init__(self, forward_ports):
         super().__init__()
         self.forward_ports = forward_ports
@@ -97,17 +97,26 @@ class SourceHTTPSHandler(urllib.request.HTTPSHandler):
         return self.do_open(connect, req, context=self._context)
 
 
-SOURCE_FORWARD_PORTS = {
+HTTPS_FORWARD_PORTS = {
     host: int(os.environ[env_name])
     for host, env_name in (
         ("abelbooks.ru", "BOOK_MONITOR_ABEL_FORWARD_PORT"),
         ("www.moscowbooks.ru", "BOOK_MONITOR_MOSCOW_FORWARD_PORT"),
+        ("api.telegram.org", "BOOK_MONITOR_TELEGRAM_FORWARD_PORT"),
     )
     if os.environ.get(env_name)
 }
-SOURCE_OPENER = urllib.request.build_opener(
-    urllib.request.ProxyHandler({}), SourceHTTPSHandler(SOURCE_FORWARD_PORTS)
-) if SOURCE_FORWARD_PORTS else None
+HTTPS_FORWARD_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), ForwardedHTTPSHandler(HTTPS_FORWARD_PORTS)
+) if HTTPS_FORWARD_PORTS else None
+
+
+def _open_url(req, timeout):
+    target = urllib.parse.urlsplit(req.full_url)
+    if (HTTPS_FORWARD_OPENER and target.scheme == "https"
+            and target.hostname in HTTPS_FORWARD_PORTS and target.port in (None, 443)):
+        return HTTPS_FORWARD_OPENER.open(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout)
 
 
 def http_get(url, binary=False, retries=2):
@@ -115,12 +124,7 @@ def http_get(url, binary=False, retries=2):
     for _ in range(retries + 1):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": UA})
-            open_url = urllib.request.urlopen
-            target = urllib.parse.urlsplit(url)
-            if (SOURCE_OPENER and target.scheme == "https"
-                    and target.hostname in SOURCE_FORWARD_PORTS and target.port in (None, 443)):
-                open_url = SOURCE_OPENER.open
-            with open_url(req, timeout=45) as r:
+            with _open_url(req, timeout=45) as r:
                 return r.read() if binary else r.read().decode("utf-8")
         except urllib.error.HTTPError as e:
             if e.code < 500:
@@ -474,11 +478,27 @@ def check_abel(fetch, token, chat, state):
 # ---------- Telegram (через прокси) ----------
 
 def _tg_open(req, timeout):
+    open_url = _open_url
     if TG_PROXY:
-        opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({"http": TG_PROXY, "https": TG_PROXY}))
-        return opener.open(req, timeout=timeout)
-    return urllib.request.urlopen(req, timeout=timeout)
+        open_url = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": TG_PROXY, "https": TG_PROXY})).open
+
+    try:
+        return open_url(req, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        if exc.code != 429:
+            raise
+        with exc:
+            try:
+                data = json.loads(exc.read())
+                delay = int(data["parameters"]["retry_after"])
+            except (OSError, ValueError, TypeError, KeyError):
+                delay = 0
+        if not 0 < delay <= 30:
+            raise
+    print(f"Telegram 429: повтор через {delay} с", file=sys.stderr)
+    time.sleep(delay)
+    return open_url(req, timeout=timeout)
 
 
 def format_message(item):
@@ -575,6 +595,8 @@ def notify(token, chat, item):
             if _send_photo(token, chat, text, data).get("ok"):
                 return
         except urllib.error.HTTPError as e:
+            if e.code == 429:
+                raise
             print(f"sendPhoto {e.code} {url}", file=sys.stderr)
             continue  # размер/пропорции/формат не подошли — пробуем следующий
     response = tg_call(token, "sendMessage", {"chat_id": chat, "text": text, "parse_mode": "HTML",
@@ -597,6 +619,8 @@ def check_source(name, fetch, token, chat, state):
                 time.sleep(1)
             except Exception as e:
                 print(f"[{name}] send error {it['id']}: {e}", file=sys.stderr)
+                if isinstance(e, urllib.error.HTTPError) and e.code == 429:
+                    break
                 continue
         seen.add(it["id"])
     state[name] = seen

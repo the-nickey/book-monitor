@@ -1,9 +1,11 @@
 """Регрессии повторных поступлений. Без сети и настоящих сообщений Telegram."""
 import copy
+from io import BytesIO
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from urllib.error import HTTPError
 from unittest.mock import patch
 
 import monitor as m
@@ -17,6 +19,30 @@ def card(pid="16688", sold=False, price="15 000 ₽", image="a.webp"):
 
 def observe(items, state=None, books=None, day="2026-10-26"):
     return m.observe_abel(items, state, books or {}, today=day, observed_at=day + "T12:00:00+00:00")
+
+
+class TelegramRateLimitTests(unittest.TestCase):
+    def test_retries_the_same_request_after_telegram_delay(self):
+        failure = HTTPError("", 429, "Too Many Requests", {}, BytesIO(b'{"parameters":{"retry_after":3}}'))
+        request = object()
+        response = object()
+        with (patch.object(m, "TG_PROXY", None),
+              patch.object(m, "_open_url", side_effect=[failure, response]) as open_url,
+              patch.object(m.time, "sleep") as sleep):
+            self.assertIs(m._tg_open(request, 30), response)
+        sleep.assert_called_once_with(3)
+        self.assertEqual(open_url.call_count, 2)
+        open_url.assert_called_with(request, timeout=30)
+
+    def test_photo_rate_limit_leaves_the_event_pending_without_text_fallback(self):
+        item = dict(card(image="cover.jpg"), tag="Абель – в продаже")
+        failure = HTTPError("", 429, "Too Many Requests", {}, None)
+        with (patch.object(m, "http_get", return_value=b"\xff\xd8\xff"),
+              patch.object(m, "_send_photo", side_effect=failure),
+              patch.object(m, "tg_call") as send_text):
+            with self.assertRaises(HTTPError):
+                m.notify("test", "test", item)
+        send_text.assert_not_called()
 
 
 class LifecycleTests(unittest.TestCase):

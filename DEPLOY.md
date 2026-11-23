@@ -23,12 +23,12 @@ Workflow в `.github/workflows/monitor.yml` оставлен только под
   До этого был платный HTTP-прокси (`telegram_proxy` в `config.json`) — умер ~22.07.2026
   с 407 (канал молчал неделю), из серверного конфига удалён (бэкап: `/root/config.backup.json`).
   Поле `telegram_proxy` кодом по-прежнему поддерживается — запасной путь, если пин отвалится.
-  На RuVDS HTTPS-запросы к Абелю и MoscowBooks идут через службу
-  `book-catalog-egress.service`. Она поднимает локальные SSH-порты для двух
-  сайтов, а drop-in `book-monitor.service.d/20-catalog-egress.conf` задаёт
-  `BOOK_MONITOR_ABEL_FORWARD_PORT` и `BOOK_MONITOR_MOSCOW_FORWARD_PORT`.
-  TLS проверяется по имени каждого сайта. Остальные источники и Telegram
-  используют свои прежние маршруты.
+  На RuVDS HTTPS-запросы к Абелю, MoscowBooks и Telegram идут через службу
+  `book-catalog-egress.service`. Локальные SSH-порты задаются в drop-in
+  `book-monitor.service.d/20-catalog-egress.conf` переменными
+  `BOOK_MONITOR_ABEL_FORWARD_PORT`, `BOOK_MONITOR_MOSCOW_FORWARD_PORT` и
+  `BOOK_MONITOR_TELEGRAM_FORWARD_PORT`. TLS проверяется по имени сайта.
+  Явно заданный `telegram_proxy` имеет приоритет над SSH-портом Telegram.
 
 ## Как задеплоено (с нуля)
 
